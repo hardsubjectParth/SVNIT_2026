@@ -1,0 +1,38 @@
+import cv2
+import numpy as np
+import config_manager
+
+def calibrate():
+    cap = cv2.VideoCapture(0)
+    print("Click the two edges of your 0.5m target, then press 'q'")
+    points = []
+
+    def click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            points.append(x)
+            print(f"Point recorded at X: {x}")
+
+    cv2.namedWindow("Calibration")
+    cv2.setMouseCallback("Calibration", click)
+
+    while True:
+        ret, frame = cap.read()
+        cv2.imshow("Calibration", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q') or len(points) >= 2:
+            break
+
+    if len(points) >= 2:
+        px_dist = abs(points[0] - points[1])
+        known_h = float(input("Current Height (m): "))
+        known_w = float(input("Physical width between points (m): "))
+        
+        total_view_w = (known_w / px_dist) * 640
+        fov = 2 * np.rad2deg(np.arctan((total_view_w / 2) / known_h))
+        print(f"\n[RESULT] Effective FOV: {fov:.2f} degrees")
+        print("Update this in the Parameter Menu.")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    calibrate()

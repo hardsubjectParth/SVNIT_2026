@@ -1,0 +1,11 @@
+[Unit]
+Description=MAVProxy Bridge
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/mavproxy.py --master=/dev/ttyAMA0 --baudrate 57600 --out=udp:127.0.0.1:14540
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# params 
+SERIAL1_PROTOCOL = 2   (RFD900)
+SERIAL1_BAUD     = 57
+
+SERIAL2_PROTOCOL = 2   (Companion)
+SERIAL2_BAUD     = 115
+
+FS_GCS_ENABLE    = 1
+FS_THR_ENABLE    = 1
+RC_OVERRIDE_TIME = 0
+
+SERVO7_FUNCTION  = 0   (Disabled / passthrough)
+
+FLTMODE6 = 4   (GUIDED)
