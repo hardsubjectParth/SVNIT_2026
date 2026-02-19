@@ -1,0 +1,7 @@
+{
+    "target_lat": 0.0,
+    "target_lon": 0.0,
+    "drop_altitude": 3.0,
+    "center_threshold_m": 0.15,
+    "descent_rate": 0.5
+}

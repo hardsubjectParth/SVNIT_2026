@@ -1,234 +1,302 @@
 import asyncio
 import json
 import os
+import glob
+import platform
 import time
-import math
-import psutil
-import sys
-import threading
 from enum import Enum
+from datetime import datetime
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
 from rich.console import Console
+from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
-from rich.table import Table
+from rich.layout import Layout
 from rich.live import Live
-from rich.text import Text
+
 from mavsdk import System
 from mavsdk.offboard import VelocityBodyYawspeed, OffboardError
 
-# ============================================================
-# VISION MOCK / SENSOR INTEGRATION
-# ============================================================
-
-class VisionSensor:
-    """Replace the mock logic here with your OpenCV/Aruco code."""
-    def __init__(self):
-        self.last_detection = {"detected": False, "x_offset": 0.0, "y_offset": 0.0}
-
-    def get_target_offset(self):
-        # MOCK: In reality, you'd pull from an OpenCV thread or Queue
-        # x_offset: -1.0 (left) to 1.0 (right)
-        # y_offset: -1.0 (back) to 1.0 (forward)
-        return self.last_detection
-
-# ============================================================
-# CONFIG & STATES
-# ============================================================
-
-CONFIG_FILE = "mission_config.json"
 console = Console()
+CONFIG_FILE="mission_config.json"
 
-class MissionState(Enum):
-    IDLE = "IDLE"
-    READY = "READY"
-    AIRBORNE = "AIRBORNE"
-    NAVIGATING = "NAVIGATING"
-    SEARCHING = "SEARCHING"
-    ALIGNING = "ALIGNING"
-    DROPPING = "DROPPING"
-    RTL = "RTL"
-    FAIL = "FAIL"
+# ==========================
+# CONFIG
+# ==========================
 
-# ============================================================
-# MAIN COMPANION STACK
-# ============================================================
+DEFAULT_CONFIG={
+"baud":57600,
+"connection":"auto",
+"target_lat":0.0,
+"target_lon":0.0,
+"search_alt":15,
+"align_threshold_m":0.15,
+"drop_alt":3,
+"descent_rate":0.5,
+"search_timeout":10,
+"camera_fov_deg":62.2,
+"image_w":640,
+"image_h":480,
+"servo_channel":1
+}
 
-class MissionCLI:
-    def __init__(self, params=None):
-        self.drone = System()
-        self.state = MissionState.IDLE
-        self.logs = []
-        self.input_queue = asyncio.Queue()
-        self.vision = VisionSensor()
-        
-        # Load Config
-        self.config = {
-            "target_lat": 21.1702, "target_lon": 72.8311,
-            "drop_alt": 3.0, "search_alt": 10.0,
-            "geofence": 150.0, "connection": "udp://:14540",
-            "p_gain": 0.5  # Gain for vision tracking
-        }
-        if params: self.config.update(params)
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        json.dump(DEFAULT_CONFIG,open(CONFIG_FILE,"w"),indent=4)
+    return json.load(open(CONFIG_FILE))
 
-    def log(self, msg, color="white"):
-        self.logs.append(Text(f"[{time.strftime('%H:%M:%S')}] {msg}", style=color))
-        if len(self.logs) > 12: self.logs.pop(0)
+def save_config(c):
+    json.dump(c,open(CONFIG_FILE,"w"),indent=4)
 
-    # --------------------------------------------------------
-    # HELPERS
-    # --------------------------------------------------------
+# ==========================
+# STATE
+# ==========================
 
-    async def wait_for_arrival(self, lat, lon, threshold=2.0):
-        """Replaces static sleep(15) with actual GPS proximity check."""
-        async for pos in self.drone.telemetry.position():
-            dist = self.get_distance(pos.latitude_deg, pos.longitude_deg, lat, lon)
-            if dist < threshold:
-                self.log(f"Arrived at waypoint (dist: {dist:.1f}m)", "green")
-                return
-            await asyncio.sleep(1)
+class State(Enum):
+    IDLE="IDLE"
+    READY="READY"
+    AIRBORNE="AIRBORNE"
+    NAV="NAV"
+    SEARCH="SEARCH"
+    ALIGN="ALIGN"
+    DESCEND="DESCEND"
+    DROP="DROP"
+    RTL="RTL"
+    COMPLETE="COMPLETE"
+    FAIL="FAIL"
 
-    def get_distance(self, lat1, lon1, lat2, lon2):
-        R = 6371000
-        phi1, phi2 = math.radians(lat1), math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlam = math.radians(lon2 - lon1)
-        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
-        return 2 * R * math.asin(math.sqrt(a))
+# ==========================
+# AUTO CONNECT
+# ==========================
 
-    # --------------------------------------------------------
-    # PRECISION ALIGNMENT (THE "VISION" CORE)
-    # --------------------------------------------------------
+async def auto_connect(drone,baud):
 
-    async def precision_align(self):
-        self.state = MissionState.ALIGNING
-        self.log("Engaging Vision Alignment...", "bold cyan")
+    if platform.system()=="Linux":
+        ports=glob.glob("/dev/ttyACM*")+glob.glob("/dev/ttyUSB*")
+    else:
+        ports=[f"COM{i}" for i in range(1,30)]
 
-        # Required: Send initial setpoint BEFORE starting offboard
-        await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0, 0, 0, 0))
+    for p in ports:
         try:
-            await self.drone.offboard.start()
-        except OffboardError as e:
-            self.log(f"Offboard failed: {e}", "red")
-            return
+            addr=f"serial://{p}:{baud}"
+            console.print(f"Trying {addr}")
+            await drone.connect(system_address=addr)
 
-        timeout = time.time() + 60 # 60s search limit
-        while time.time() < timeout:
-            data = self.vision.get_target_offset()
-            
-            if data["detected"]:
-                # P-Controller: Velocity = Offset * Gain
-                # Note: Body frame x is forward, y is right
-                v_forward = data["y_offset"] * self.config["p_gain"]
-                v_right = data["x_offset"] * self.config["p_gain"]
-                
-                await self.drone.offboard.set_velocity_body(
-                    VelocityBodyYawspeed(v_forward, v_right, 0, 0)
-                )
+            async for s in drone.core.connection_state():
+                if s.is_connected:
+                    console.print(f"[green]Connected {p}")
+                    return
+                break
+        except:
+            pass
 
-                # Check if centered (e.g. within 10cm)
-                if abs(data["x_offset"]) < 0.1 and abs(data["y_offset"]) < 0.1:
-                    self.log("Target Centered!", "bold green")
-                    break
-            else:
-                # Target lost: Hover or slow spiral
-                await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0,0,0,10))
-            
-            await asyncio.sleep(0.1)
+    raise Exception("No autopilot")
 
-        await self.drone.offboard.stop()
+# ==========================
+# YOLO VISION
+# ==========================
 
-    # --------------------------------------------------------
-    # MISSION FLOW
-    # --------------------------------------------------------
+class Vision:
 
-    async def start_mission(self):
-        try:
-            self.log("ARMING...", "yellow")
-            await self.drone.action.arm()
-            
-            self.log("TAKEOFF...", "yellow")
-            await self.drone.action.takeoff()
-            self.state = MissionState.AIRBORNE
-            await asyncio.sleep(5)
+    def __init__(self,conf):
+        self.model=YOLO("landing_h.pt")
+        self.fov=np.deg2rad(conf["camera_fov_deg"])
+        self.w=conf["image_w"]
+        self.h=conf["image_h"]
 
-            self.state = MissionState.NAVIGATING
-            self.log(f"Navigating to GPS: {self.config['target_lat']}", "cyan")
-            await self.drone.action.goto_location(
-                self.config["target_lat"], self.config["target_lon"], 
-                self.config["search_alt"], 0
-            )
-            await self.wait_for_arrival(self.config["target_lat"], self.config["target_lon"])
+    def detect(self,frame,alt):
 
-            # 2. Vision Refinement
-            await self.precision_align()
+        res=self.model(frame,verbose=False)
+        if len(res)==0 or len(res[0].boxes)==0:
+            return None
 
-            # 3. Descent & Drop
-            self.state = MissionState.DROPPING
-            self.log("Descending for drop...", "magenta")
-            # Logic for payload release (GPIO or MAVLink command) goes here
-            
-            await self.drone.action.return_to_launch()
-            self.state = MissionState.RTL
-        except Exception as e:
-            self.log(f"MISSION CRITICAL ERROR: {e}", "red")
-            await self.drone.action.return_to_launch()
+        box=res[0].boxes[0].xywh[0]
+        cx=float(box[0])
+        cy=float(box[1])
 
-    # --------------------------------------------------------
-    # UI & INPUT (NON-BLOCKING)
-    # --------------------------------------------------------
+        view_w=2*alt*np.tan(self.fov/2)
+        mpp=view_w/self.w
 
-    def ui_layout(self):
-        layout = Layout()
+        off_x=(cx-self.w/2)*mpp
+        off_y=(cy-self.h/2)*mpp
+
+        return off_x,off_y
+
+# ==========================
+# CLI MISSION
+# ==========================
+
+class Mission:
+
+    def __init__(self):
+        self.config=load_config()
+        self.drone=System()
+        self.state=State.IDLE
+        self.logs=[]
+        self.vision=Vision(self.config)
+
+    def log(self,msg):
+        t=datetime.now().strftime("%H:%M:%S")
+        line=f"[{t}] {msg}"
+        self.logs.append(line)
+        if len(self.logs)>12:self.logs.pop(0)
+        print(line)
+
+    def layout(self):
+        layout=Layout()
         layout.split_column(
-            Layout(Panel("SVNIT PRECISION STACK v2.0", style="bold green"), size=3),
-            Layout(name="body")
-        )
-        info = f"[b]State:[/b] {self.state.value}\n[b]Target:[/b] {self.config['target_lat']}\n[b]Vision:[/b] {'LOCKED' if self.vision.get_target_offset()['detected'] else 'SEARCHING'}"
-        layout["body"].split_row(
-            Layout(Panel(info, title="Drone Status")),
-            Layout(Panel("\n".join([l.plain for l in self.logs]), title="System Logs"))
+            Layout(Panel("SVNIT COMPANION",style="bold cyan"),size=3),
+            Layout(Panel("\n".join(self.logs),title=f"State:{self.state.value}"))
         )
         return layout
 
-    async def run(self):
-        # 1. Connect
-        self.log(f"Connecting to {self.config['connection']}...")
-        await self.drone.connect(system_address=self.config["connection"])
-        
-        # 2. Start Background Watchers
-        # (Geofence, CPU monitors, etc. as tasks)
+    # ======================
+    # TEST MODES
+    # ======================
 
-        # 3. Main Loop
-        with Live(self.ui_layout(), refresh_per_second=4, screen=True) as live:
+    async def health(self):
+        async for h in self.drone.telemetry.health():
+            self.log(f"GPS {h.is_global_position_ok}")
+            break
+
+    async def arm_test(self):
+        await self.drone.action.arm()
+        await asyncio.sleep(2)
+        await self.drone.action.disarm()
+        self.log("Arm OK")
+
+    async def hover_test(self):
+        await self.drone.action.arm()
+        await self.drone.action.takeoff()
+        await asyncio.sleep(5)
+        await self.drone.action.land()
+        self.log("Hover OK")
+
+    async def rtl_test(self):
+        await self.drone.action.return_to_launch()
+        self.log("RTL sent")
+
+    # ======================
+    # MISSION
+    # ======================
+
+    async def run_mission(self):
+
+        try:
+
+            self.log("ARM")
+            await self.drone.action.arm()
+
+            self.log("TAKEOFF")
+            await self.drone.action.takeoff()
+            self.state=State.AIRBORNE
+            await asyncio.sleep(8)
+
+            self.log("NAV GPS")
+            self.state=State.NAV
+            await self.drone.action.goto_location(
+                self.config["target_lat"],
+                self.config["target_lon"],
+                self.config["search_alt"],
+                0)
+
+            await asyncio.sleep(15)
+
+            cap=cv2.VideoCapture(0)
+
+            await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0,0,0,0))
+            await self.drone.offboard.start()
+
+            start=time.time()
+            self.state=State.SEARCH
+
             while True:
-                live.update(self.ui_layout())
-                
-                # Check for user commands in queue
-                if not self.input_queue.empty():
-                    cmd = await self.input_queue.get()
-                    if cmd == 'm': asyncio.create_task(self.start_mission())
-                    if cmd == 'r': await self.drone.action.return_to_launch()
-                    if cmd == 'q': break
-                
-                await asyncio.sleep(0.1)
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+                ret,frame=cap.read()
+                if not ret: continue
 
-def keyboard_listener(queue, loop):
-    """Runs in a separate thread to handle blocking input."""
-    while True:
-        cmd = input().lower()
-        loop.call_soon_threadsafe(queue.put_nowait, cmd)
+                async for pos in self.drone.telemetry.position():
+                    alt=pos.relative_altitude_m
+                    break
 
-if __name__ == "__main__":
-    cli = MissionCLI()
-    loop = asyncio.get_event_loop()
-    
-    # Start thread to listen for keys (m=mission, r=rtl, q=quit)
-    threading.Thread(target=keyboard_listener, args=(cli.input_queue, loop), daemon=True).start()
-    
-    try:
-        loop.run_until_complete(cli.run())
-    except KeyboardInterrupt:
-        pass
+                tgt=self.vision.detect(frame,alt)
+
+                # DETECTED
+                if tgt:
+
+                    self.state=State.ALIGN
+                    ox,oy=tgt
+                    thr=self.config["align_threshold_m"]
+
+                    vx=0.4 if oy>thr else -0.4 if oy<-thr else 0
+                    vy=0.4 if ox>thr else -0.4 if ox<-thr else 0
+                    vz=self.config["descent_rate"] if vx==0 and vy==0 else 0
+
+                    await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(vx,vy,vz,0))
+
+                    if alt<=self.config["drop_alt"] and vx==0 and vy==0:
+                        self.state=State.DROP
+                        self.log("DROP")
+                        await self.drone.action.set_actuator(self.config["servo_channel"],1)
+                        await asyncio.sleep(2)
+                        break
+
+                # NOT DETECTED
+                else:
+                    if time.time()-start>self.config["search_timeout"]:
+                        self.log("GPS DROP")
+                        await self.drone.action.set_actuator(self.config["servo_channel"],1)
+                        break
+                    await self.drone.offboard.set_velocity_body(VelocityBodyYawspeed(0,0,0,20))
+
+            await self.drone.offboard.stop()
+
+            self.state=State.RTL
+            await self.drone.action.return_to_launch()
+
+            self.state=State.COMPLETE
+
+        except Exception as e:
+            self.log(str(e))
+            self.state=State.FAIL
+            await self.drone.action.return_to_launch()
+
+    # ======================
+    # CLI
+    # ======================
+
+    async def run(self):
+
+        if self.config["connection"]=="auto":
+            await auto_connect(self.drone,self.config["baud"])
+        else:
+            await self.drone.connect(system_address=self.config["connection"])
+
+        with Live(self.layout(),refresh_per_second=4,screen=True) as live:
+
+            while True:
+                live.update(self.layout())
+
+                cmd=Prompt.ask("1Health 2Arm 3Hover 4RTL 5Mission 6Params 7Exit")
+
+                if cmd=="1":await self.health()
+                if cmd=="2":await self.arm_test()
+                if cmd=="3":await self.hover_test()
+                if cmd=="4":await self.rtl_test()
+                if cmd=="5":await self.run_mission()
+                if cmd=="6":
+                    k=Prompt.ask("Key")
+                    v=Prompt.ask("Val")
+                    self.config[k]=float(v) if v.replace('.','',1).isdigit() else v
+                    save_config(self.config)
+                if cmd=="7":break
+
+# ==========================
+# ENTRY
+# ==========================
+
+if __name__=="__main__":
+    asyncio.run(Mission().run())
