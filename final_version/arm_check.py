@@ -8,7 +8,7 @@ import platform
 if platform.system() == "Windows":
     SERIAL_PORT = "COM6"      # change to your COM port
 else:
-    SERIAL_PORT = "/dev/ttyUSB0"  # for Raspberry Pi
+    SERIAL_PORT = "/dev/ttyACM0"  # for Raspberry Pi
 
 BAUD_RATE = 57600
 
