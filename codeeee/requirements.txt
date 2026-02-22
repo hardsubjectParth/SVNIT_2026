@@ -1,0 +1,22 @@
+# SVNIT UAV Companion — Requirements
+
+mavsdk>=1.4.0
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+rich>=13.0.0
+
+# ── Raspberry Pi / Jetson install notes ──────────────────────────
+# pip install -r requirements.txt --break-system-packages
+#
+# For MAVSDK server binary (required):
+#   Download from https://github.com/mavlink/MAVSDK/releases
+#   Place mavsdk_server binary in PATH or same folder as main.py
+#
+# For YOLOv8 model:
+#   Place best_yolov8s.pt in the same directory as main.py
+#
+# For RFD900 telemetry (Mission Planner visibility):
+#   FC Telem2 UART → RFD900 radio → USB to GCS PC
+#   Mission Planner → Connect on RFD COM port → Messages tab
+#   All [SVNIT] prefixed messages appear in real time
